@@ -1,1 +1,94 @@
 
+--Stat check on challenges for players past D0 within specified time frame--
+with Available_users_per_Challenge as (
+    select challenges.id,
+           title,
+           available_from,
+           available_to,
+           (available_to - available_from) as duration,
+           count(distinct user_id)         as possible_users
+    from challenges
+             Cross join ios_app.app_opened
+             left join users on user_id = users.firebase_user_id
+    where ios_app.app_opened.timestamp between available_from AND available_to
+      and challenges.id is not null
+--and (convert_timezone('UTC', context_timezone, ios_app.app_opened.timestamp)) - users.created_at < '24:00:00'
+    group by challenges.id, title, available_from, available_to
+    order by possible_users desc
+),
+     non_D0_entries as (select *
+                        from challenge_entries
+                                 left join users on user_id = users.id
+                        where submitted_at is not null
+--where challenge_entries.created_at - users.created_at < '24:00:00'
+     ),
+     photoshoot_entrants as (select count(distinct users.id) as entrants, challenge_id
+                             from challenge_entries
+                                      left join users on user_id = users.id
+--where (convert_timezone('UTC', context_timezone, ios_app.photoshoot_started.timestamp)) - users.created_at < '24:00:00'
+                             group by challenge_id),
+     moodboard_entrants as (select count(distinct users.id) as entrants, challenge_id
+                            from ios_app.moodboard_started
+                                     left join users on user_id = users.firebase_user_id
+--where (convert_timezone('UTC', context_timezone, ios_app.moodboard_started.timestamp)) - users.created_at < '24:00:00'
+                            group by challenge_id),
+     challenge_entrants as (select *
+                            from photoshoot_entrants
+                            union
+                            select *
+                            from moodboard_entrants),
+     cost_to_player_at_completed as (select avg(dollars_sinked) as dollar_cost, challenge_id
+                                     from ios_app.photoshoot_completed
+                                              left join users on photoshoot_completed.user_id = users.firebase_user_id
+--where (convert_timezone('UTC', context_timezone, ios_app.photoshoot_completed.timestamp)) - users.created_at < '24:00:00'
+                                     group by challenge_id),
+     cost_to_player_at_saved as (select avg(dollars_sinked) as dollar_cost, challenge_id
+                                 from ios_app.photoshoot_saved
+                                          left join users on photoshoot_saved.user_id = users.firebase_user_id
+--where (convert_timezone('UTC', context_timezone, ios_app.photoshoot_saved.timestamp)) - users.created_at < '24:00:00'
+                                 group by challenge_id),
+     cost_to_player as (select (cost_to_player_at_completed.dollar_cost +
+                                cost_to_player_at_saved.dollar_cost) as dollar_cost,
+                               cost_to_player_at_completed.challenge_id
+                        from cost_to_player_at_completed
+                                 join cost_to_player_at_saved
+                                      on cost_to_player_at_completed.challenge_id = cost_to_player_at_saved.challenge_id
+--group by cost_to_player_at_completed.challenge_id
+     )
+select
+--count(challenge_entries.user_id),
+challenges.title,
+challenges.franchise,
+(challenge_entrants.entrants::float / Available_users_per_Challenge.possible_users::float) as percent_DAU_started,
+(count(distinct non_D0_entries.user_id)::float /
+ Available_users_per_Challenge.possible_users::float)                                      as Percent_DAU_completed,
+(count(distinct non_D0_entries.user_id)::float /
+ challenge_entrants.entrants)                                                              as Percent_starters_completed,
+(case
+     when date_part(dow, challenges.available_from) = 0 then 'Sunday'
+     when date_part(dow, challenges.available_from) = 1 then 'Monday'
+     when date_part(dow, challenges.available_from) = 2 then 'Tuesday'
+     when date_part(dow, challenges.available_from) = 3 then 'Wednesday'
+     when date_part(dow, challenges.available_from) = 4 then 'Thursday'
+     when date_part(dow, challenges.available_from) = 5 then 'Friday'
+     when date_part(dow, challenges.available_from) = 6 then 'Saturday'
+    end)                                                                                   as day_of_the_week,
+challenges.available_from,
+challenges.priority,
+cost_to_player.dollar_cost                                                                 as average_DD_cost
+from challenges
+         left join non_D0_entries on non_D0_entries.challenge_id = challenges.id
+         left join Available_users_per_Challenge on Available_users_per_Challenge.id = challenges.id
+         left join challenge_entrants on challenge_entrants.challenge_id = non_D0_entries.challenge_id
+         left join cost_to_player on cost_to_player.challenge_id = non_D0_entries.challenge_id
+         left join users on non_D0_entries.user_id = users.id
+where challenges.available_from >= (getdate()::date - 30)
+  and challenges.available_from < getdate()::date - 1
+--and challenges.type like 'Look%'
+  and challenges.priority = 1
+--and challenges.franchise like 'One Piece, Your Way'
+--and challenges.title like 'Comeback Dress'
+group by challenges.title, challenges.available_from, challenges.available_to, challenges.franchise,
+         challenges.priority, Available_users_per_Challenge.possible_users, challenge_entrants.entrants,
+         cost_to_player.dollar_cost
+order by Percent_DAU_completed desc
